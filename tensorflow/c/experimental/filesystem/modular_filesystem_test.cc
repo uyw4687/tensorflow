@@ -27,10 +27,9 @@ limitations under the License.
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/util/command_line_flags.h"
 
-// TODO(b/143949264): Testing is not yet supported on Windows. Will implement
-// testing on Windows when implementing modular filesystems on Windows.
 #if defined(PLATFORM_WINDOWS)
-#error Windows is not yet supported.  Need mkdir().
+#include <direct.h>
+#define mkdir(name, mode) _mkdir(name)
 #endif
 
 // The tests defined here test the compliance of filesystems with the API
@@ -86,9 +85,6 @@ class ModularFileSystemTest : public ::testing::TestWithParam<std::string> {
   }
 
   void SetUp() override {
-    // TODO(b/143949264): Testing is not yet supported on Windows. Will
-    // implement testing on Windows when implementing modular filesystems on
-    // Windows.
     if (mkdir(root_dir_.c_str(), 0755) != 0) {
       int error_code = errno;
       GTEST_SKIP() << "Cannot create working directory: "
