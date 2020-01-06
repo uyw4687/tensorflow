@@ -28,6 +28,7 @@ namespace tf_random_access_file {
 
 // SECTION 2. Implementation for `TF_WritableFile`
 // ----------------------------------------------------------------------------
+namespace tf_writable_file {
 
 // TODO(mihaimaruseac): Implement later
 
@@ -35,6 +36,7 @@ namespace tf_random_access_file {
 
 // SECTION 3. Implementation for `TF_ReadOnlyMemoryRegion`
 // ----------------------------------------------------------------------------
+namespace tf_read_only_memory_region {
 
 // TODO(mihaimaruseac): Implement later
 
@@ -42,10 +44,11 @@ namespace tf_random_access_file {
 
 // SECTION 4. Implementation for `TF_Filesystem`, the actual filesystem
 // ----------------------------------------------------------------------------
+namespace tf_windows_filesystem {
 
 // TODO(mihaimaruseac): Implement later
 
-}  // namespace tf_posix_filesystem
+}  // namespace tf_windows_filesystem
 
 void TF_InitPlugin(TF_Status* status) {
 }
