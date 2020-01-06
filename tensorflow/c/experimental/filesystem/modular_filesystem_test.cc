@@ -28,9 +28,17 @@ limitations under the License.
 #include "tensorflow/core/util/command_line_flags.h"
 
 #if defined(PLATFORM_WINDOWS)
+// Make mkdir resolve to _mkdir to create the test temporary directory.
 #include <direct.h>
 #define mkdir(name, mode) _mkdir(name)
-#endif
+
+// Windows defines the following macros to convert foo to fooA or fooW,
+// depending on the type of the string argument. We don't use these macros, so
+// undefine them here.
+#undef LoadLibrary
+#undef CopyFile
+#undef DeleteFile
+#endif  // defined(PLATFORM_WINDOWS)
 
 // The tests defined here test the compliance of filesystems with the API
 // defined by `filesystem_interface.h`.
