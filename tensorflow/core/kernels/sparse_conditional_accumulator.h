@@ -17,6 +17,8 @@ limitations under the License.
 #define TENSORFLOW_CORE_KERNELS_SPARSE_CONDITIONAL_ACCUMULATOR_H_
 
 #include "tensorflow/core/kernels/typed_conditional_accumulator_base.h"
+#include "tensorflow/core/platform/logging.h"
+#include <map>
 
 namespace tensorflow {
 
@@ -54,25 +56,25 @@ class SparseConditionalAccumulator
       : TypedConditionalAccumulatorBase<
             std::tuple<const Tensor*, const Tensor*, const Tensor*>>(
             dtype, shape, name) {
-    accum_idx_vec_ = nullptr;
-    count_element_ = nullptr;
-    accum_val_ = nullptr;
-    accum_val_persistent_ = new PersistentTensor();
+    LOG(INFO) << "Constructor";
+    accum_idx_val_val_persistent_map_ = new std::map<int64, std::pair<Tensor*, PersistentTensor*>>();
+    count_element_map_ = new std::map<int64, int>();
+    LOG(INFO) << "Constructor";
   }
 
   ~SparseConditionalAccumulator() override {
-    if (accum_idx_vec_ != nullptr) delete accum_idx_vec_;
-    if (count_element_ != nullptr) delete count_element_;
-    if (accum_val_persistent_ != nullptr) delete accum_val_persistent_;
-    // Do not delete accum_val_! Will be automatically garbage collected
+    if (accum_idx_val_val_persistent_map_ != nullptr) {
+        for (std::map<int64, std::pair<Tensor*, PersistentTensor*>>::iterator it= (*accum_idx_val_val_persistent_map_).begin(); it!=(*accum_idx_val_val_persistent_map_).end(); ++it) {
+            if ( it->second.second != nullptr) delete it->second.second;
+        }
+        delete accum_idx_val_val_persistent_map_;
+    }
+    if (count_element_map_ != nullptr) delete count_element_map_;
   };
 
  protected:
-  std::vector<int64>* accum_idx_vec_ = nullptr;
-  std::vector<int>* count_element_ = nullptr;
-
-  Tensor* accum_val_ = nullptr;
-  PersistentTensor* accum_val_persistent_ = nullptr;
+  std::map<int64, std::pair<Tensor*, PersistentTensor*>>* accum_idx_val_val_persistent_map_ = nullptr;
+  std::map<int64, int>* count_element_map_ = nullptr;
 
   typedef Eigen::TensorMap<Eigen::Tensor<T, 1, Eigen::RowMajor>,
                            Eigen::Unaligned>
@@ -122,16 +124,18 @@ class SparseConditionalAccumulator
 
     // Check values compatibility with accumulated gradient if available
     if (counter_ > 0) {
-      int64 accum_val_dims = accum_val_->dims();
-      if (accum_val_dims != grad_val_dims) {
+      Tensor* accum_map_val_first_ = (*accum_idx_val_val_persistent_map_).begin()->second.first;
+      // Note that the new tensor's shape is also a matrix which has one column
+      int64 accum_val_map_dims = accum_map_val_first_->dims();
+      if (accum_val_map_dims != grad_val_dims) {
         return errors::InvalidArgument("Shape mismatch: expected values rank ",
-                                       accum_val_dims, ", got ", grad_val_dims);
+                                       accum_val_map_dims, ", got ", grad_val_dims, "**CAUSED IN MAP IMPLEMENTATION**");
       }
-      for (int64 i = 1; i < accum_val_dims; i++) {
-        if (accum_val_->dim_size(i) != tensor_val->dim_size(i)) {
+      for (int64 i = 1; i < accum_val_map_dims; i++) {
+        if (accum_map_val_first_->dim_size(i) != tensor_val->dim_size(i)) {
           return errors::InvalidArgument("Shape mismatch: expected values dim ",
-                                         i, " to be ", accum_val_->dim_size(i),
-                                         ", got ", tensor_val->dim_size(i));
+                                         i, " to be ", accum_map_val_first_->dim_size(i),
+                                         ", got ", tensor_val->dim_size(i), "**CAUSED IN MAP IMPLEMENTATION**");
         }
       }
     } else {
@@ -163,28 +167,63 @@ class SparseConditionalAccumulator
 
     const int64 nnz = grad_idx->dim_size(0);
 
-    // Assign indices
-    if (accum_idx_vec_ != nullptr) delete accum_idx_vec_;
-    accum_idx_vec_ = new std::vector<int64>();
-    accum_idx_vec_->reserve(nnz);
-    for (int i = 0; i < nnz; i++) {
-      accum_idx_vec_->push_back(grad_idx->vec<int64>()(i));
+    LOG(INFO) << "Allocate";
+
+    // Assign indices and values to accum_idx_val_val_persistent_map_
+    if (accum_idx_val_val_persistent_map_ != nullptr) {
+        for (std::map<int64, std::pair<Tensor*, PersistentTensor*>>::iterator it= (*accum_idx_val_val_persistent_map_).begin(); it!=(*accum_idx_val_val_persistent_map_).end(); ++it) {
+            if ( it->second.second != nullptr) delete it->second.second;
+            LOG(INFO) << "Allocate : inside iterator";
+        }
+        delete accum_idx_val_val_persistent_map_;
+    }
+    accum_idx_val_val_persistent_map_ = new std::map<int64, std::pair<Tensor*, PersistentTensor*>>();
+
+    TensorShape tensor_shape = grad_val->shape();
+    tensor_shape.set_dim(0, 1);
+
+    auto grad_flat = grad_val->flat_outer_dims<T>();
+
+    const int num_col = grad_flat.dimension(1);
+
+    LOG(INFO) << "Allocate - num_col : " << num_col;
+
+    Eigen::array<long, 2> extent = {1, num_col};
+    Eigen::array<long, 2> extent2 = {1, num_col<3 ? num_col : 3};
+ 
+    // Assign count_element_map_
+    if (count_element_map_ != nullptr) {
+        delete count_element_map_;
     }
 
-    // Assign values to accum_val_tensor
-    // TODO(b/32704451): Don't just ignore the ::tensorflow::Status object!
-    ctx->allocate_persistent(dtype_, grad_val->shape(), accum_val_persistent_,
-                             &accum_val_)
-        .IgnoreError();
-    accum_val_->flat<T>().device(ctx->template eigen_device<Device>()) =
-        grad_val->flat<T>();
+    LOG(INFO) << "Allocate nnz : " << nnz;
 
-    // Assign count_element_
-    if (count_element_ != nullptr) {
-      delete count_element_;
+    count_element_map_ = new std::map<int64, int>();
+    
+    for (int64 i = 0; i < nnz; i++) {
+        Tensor* temp_accum_val_ = nullptr;
+        PersistentTensor* temp_accum_val_persistent_ = new PersistentTensor();
+        // TODO(b/32704451): Don't just ignore the ::tensorflow::Status object!
+        ctx->allocate_persistent(dtype_, tensor_shape, temp_accum_val_persistent_,
+                             &temp_accum_val_)
+            .IgnoreError();
+        
+        Eigen::array<long, 2> offset = {i, 0};
+
+        Eigen::array<long, 2> offset2 = {0, 0};
+
+        temp_accum_val_->flat_outer_dims<T>().device(ctx->template eigen_device<Device>()) =
+            grad_flat.slice(offset, extent).reshape(Eigen::array<long, 2>({1, num_col}));
+
+        LOG(INFO) << "Allocate : grad_idx->vec<int64>()(i) : " << grad_idx->vec<int64>()(i);
+
+        LOG(INFO) << "Allocate : temp_accum_val_ : " << temp_accum_val_->flat_outer_dims<T>().slice(offset2, extent2);
+
+        (*accum_idx_val_val_persistent_map_)[grad_idx->vec<int64>()(i)] = std::make_pair(temp_accum_val_, temp_accum_val_persistent_); 
+        (*count_element_map_)[grad_idx->vec<int64>()(i)] = 1; 
     }
-    count_element_ = new std::vector<int>(nnz, 1);
 
+    LOG(INFO) << "Allocate";
     // Do not need shape; Assume that the op has checked that the shapes match,
     // so grad's shape == shape_
   }
@@ -197,159 +236,177 @@ class SparseConditionalAccumulator
     const Tensor* grad_idx = std::get<0>(*grad);
     const Tensor* grad_val = std::get<1>(*grad);
 
-    const int64 accum_nnz = accum_idx_vec_->size();
     const int64 grad_nnz = grad_idx->dim_size(0);
 
-    // Source enumerates the origin of a non-zero element: whether it is from
-    // the new gradient, the accumulated gradient, or the sum of both.
-    enum Source { from_accum, from_grad, from_accum_and_grad };
-
-    // (1) do a pass over inputs, and append values and indices to vectors
-    std::vector<std::tuple<Source, int64, int64>> entries_to_copy;
-    entries_to_copy.reserve(accum_nnz + grad_nnz);
-
-    // Pass over all non-zero elements of both the gradient and the accumulated
-    // value, to identify where each non-zero element of the sum comes from.
-    // The input and output indexed slices are assumed to be ordered along
-    // increasing dimension number.
-    int64 i = 0, j = 0;
-    int64 sum_nnz = 0;
-    while (i < accum_nnz && j < grad_nnz) {
-      sum_nnz++;
-      switch (cmp(accum_idx_vec_, grad_idx, i, j)) {
-        case -1:
-          entries_to_copy.emplace_back(from_accum, i, -1);
-          ++i;
-          break;
-        case 0:
-          entries_to_copy.emplace_back(from_accum_and_grad, i, j);
-          ++i;
-          ++j;
-          break;
-        case 1:
-          entries_to_copy.emplace_back(from_grad, -1, j);
-          ++j;
-          break;
-      }
-    }
-
-    // Handle leftovers
-    while (i < accum_nnz) {
-      sum_nnz++;
-      entries_to_copy.emplace_back(from_accum, i, -1);
-      ++i;
-    }
-    while (j < grad_nnz) {
-      sum_nnz++;
-      entries_to_copy.emplace_back(from_grad, -1, j);
-      ++j;
-    }
-
-    // (2) Copy or sum the non-zero elements into sum_indices and sum_tensor
-    std::vector<int64>* sum_indices_vec = new std::vector<int64>();
-    sum_indices_vec->reserve(sum_nnz);
-
-    std::vector<int>* sum_counts = new std::vector<int>();
-    sum_counts->reserve(sum_nnz);
-
-    Tensor* sum_tensor = nullptr;
-    PersistentTensor* tensor_sum_persistent = new PersistentTensor();
-
-    TensorShape sum_shape = grad_val->shape();
-    sum_shape.set_dim(0, sum_nnz);
-
-    OP_REQUIRES_OK(
-        ctx, ctx->allocate_persistent(dtype_, sum_shape, tensor_sum_persistent,
-                                      &sum_tensor));
-    auto sum_flat = sum_tensor->flat_outer_dims<T>();
-    auto accum_flat = accum_val_->flat_outer_dims<T>();
     auto grad_flat = grad_val->flat_outer_dims<T>();
-
     const int64 num_col = grad_flat.dimension(1);
-
     Eigen::DSizes<Eigen::DenseIndex, 1> slice_shape(num_col);
 
-    for (i = 0; i < sum_nnz; ++i) {
-      const Source src = std::get<0>(entries_to_copy[i]);
-      const int64 idx_a = std::get<1>(entries_to_copy[i]);
-      const int64 idx_b = std::get<2>(entries_to_copy[i]);
-      T* sum_slice_ptr = &sum_flat(i, 0);
-      SliceT sum_slice(sum_slice_ptr, slice_shape);
-      if (src == from_accum) {
-        // Element comes from accumulator; directly copy data structures over
-        sum_indices_vec->push_back(accum_idx_vec_->at(idx_a));
-        T* accum_slice_ptr = &accum_flat(idx_a, 0);
-        SliceT accum_slice(accum_slice_ptr, slice_shape);
-        sum_slice = accum_slice;
-        sum_counts->push_back(count_element_->at(idx_a));
-      } else if (src == from_accum_and_grad) {
-        // Element is a sum of accumulated value and new gradient;
-        // compute sum here
-        sum_indices_vec->push_back(accum_idx_vec_->at(idx_a));
-        const T* grad_slice_ptr = &grad_flat(idx_b, 0);
-        SliceConstT grad_slice(grad_slice_ptr, slice_shape);
-        T* accum_slice_ptr = &accum_flat(idx_a, 0);
-        SliceT accum_slice(accum_slice_ptr, slice_shape);
-        sum_slice = grad_slice + accum_slice;
-        sum_counts->push_back(count_element_->at(idx_a) + 1);
-      } else if (src == from_grad) {
-        // Element comes from new gradient; make a copy of indices and values
-        sum_indices_vec->push_back(grad_idx->vec<int64>()(idx_b));
-        const T* grad_slice_ptr = &grad_flat(idx_b, 0);
-        SliceConstT grad_slice(grad_slice_ptr, slice_shape);
-        sum_slice = grad_slice;
-        sum_counts->push_back(1);
-      }
+    LOG(INFO) << "Add";
+
+    LOG(INFO) << "Add : num_col : " << num_col;
+
+    int64 j = 0;
+    {
+        std::map<int64, std::pair<Tensor*, PersistentTensor*>>::iterator it = (*accum_idx_val_val_persistent_map_).begin();
+        
+        TensorShape tensor_shape = grad_val->shape();
+        tensor_shape.set_dim(0, 1);
+
+        Eigen::array<long, 2> extent = {1, num_col};
+        Eigen::array<long, 2> extent2 = {1, num_col<3 ? num_col : 3};
+
+        while (j < grad_nnz) {
+            int64 b = grad_idx->vec<int64>()(j); 
+            it = accum_idx_val_val_persistent_map_->lower_bound(b);
+
+        LOG(INFO) << "Add : grad_idx->vec<int64>()(j) : " << grad_idx->vec<int64>()(j);
+            // Element is a sum of accumulated value and new gradient;
+            // compute sum here
+            if (it != accum_idx_val_val_persistent_map_->end() && it->first == b) {
+                const T* grad_slice_ptr = &grad_flat(j, 0);
+                SliceConstT grad_slice(grad_slice_ptr, slice_shape);
+                T* accum_slice_ptr = &(it->second.first->flat_outer_dims<T>())(0, 0);
+                SliceT accum_slice(accum_slice_ptr, slice_shape);
+                accum_slice = grad_slice + accum_slice;
+
+        LOG(INFO) << "Add : (*count_element_map_)[it->first]" << (*count_element_map_)[it->first];
+                (*count_element_map_)[it->first] += 1;
+
+                Eigen::array<long, 2> offset2 = {0, 0};
+
+        LOG(INFO) << "Add : it->second.first->flat_outer_dims<T>() : " << it->second.first->flat_outer_dims<T>().slice(offset2, extent2);
+
+        LOG(INFO) << "Add : (*count_element_map_)[it->first]" << (*count_element_map_)[it->first];
+
+
+            }
+            else {
+            // Element comes from new gradient; make a copy of indices and values
+                Tensor* temp_accum_val_ = nullptr;
+                PersistentTensor* temp_accum_val_persistent_ = new PersistentTensor();
+                ctx->allocate_persistent(dtype_, tensor_shape, temp_accum_val_persistent_,
+                                     &temp_accum_val_)
+                    .IgnoreError();
+    
+                Eigen::array<long, 2> offset = {j, 0};
+                Eigen::array<long, 2> offset2 = {0, 0};
+
+                temp_accum_val_->flat<T>().device(ctx->template eigen_device<Device>()) =
+                    grad_flat.slice(offset, extent).reshape(Eigen::array<long, 2>({1, num_col}));
+    
+                (*accum_idx_val_val_persistent_map_).insert(it, std::make_pair(grad_idx->vec<int64>()(j), std::make_pair(temp_accum_val_, temp_accum_val_persistent_))); 
+                (*count_element_map_)[it->first] = 1;
+
+        LOG(INFO) << "Add : (*accum_idx_val_val_persistent_map_)[grad_idx->vec<int64>()(j)].first->flat_outer_dims<T>() : " << (*accum_idx_val_val_persistent_map_)[grad_idx->vec<int64>()(j)].first->flat_outer_dims<T>().slice(offset2, extent2);
+
+            }
+            j++; 
+        }
     }
 
-    // (3) Keep output, i.e., switch pointers to point to new data structures
-    // representing the sum
-    // Indices
-    if (accum_idx_vec_ != nullptr) delete accum_idx_vec_;
-    accum_idx_vec_ = sum_indices_vec;
-    // Values
-    accum_val_ = sum_tensor;
-    delete accum_val_persistent_;
-    accum_val_persistent_ = tensor_sum_persistent;
-    // Counts
-    if (count_element_ != nullptr) delete count_element_;
-    count_element_ = sum_counts;
-
+    LOG(INFO) << "Add";
     // No need to copy shape, since shape remains the same after sum.
   }
 
-  void DivideAccumGradByCounter(OpKernelContext* ctx) override
+  void DivideAccumGradByCounter(OpKernelContext* ctx, int average_option) override
       EXCLUSIVE_LOCKS_REQUIRED(this->mu_) {
-    const int64 nnz = count_element_->size();
-    auto accum_flat = accum_val_->flat_outer_dims<T>();
+    const int64 nnz = accum_idx_val_val_persistent_map_->size();
+
+    Tensor* accum_val_tensor_ = nullptr;
+    Tensor* accum_map_val_first_ = (*accum_idx_val_val_persistent_map_).begin()->second.first;
+    TensorShape accum_val_shape = accum_map_val_first_->shape();
+    accum_val_shape.set_dim(0, nnz);
+    PersistentTensor* tensor_accum_val_persistent = new PersistentTensor();
+    OP_REQUIRES_OK(
+        ctx, ctx->allocate_persistent(dtype_, accum_val_shape, tensor_accum_val_persistent,
+                                      &accum_val_tensor_));
+
+    auto accum_val_flat = accum_val_tensor_->flat_outer_dims<T>();
+    const int64 num_col = (accum_map_val_first_->flat_outer_dims<T>()).dimension(1);
+    LOG(INFO) << "Divide";
+
+    {
+        Eigen::DSizes<Eigen::DenseIndex, 1> slice_shape(num_col);
+        std::map<int64, std::pair<Tensor*, PersistentTensor*>>::iterator it;
+        int64 i;
+        for (it = (*accum_idx_val_val_persistent_map_).begin(), i = 0; it!=(*accum_idx_val_val_persistent_map_).end(); ++it, ++i) {
+            T* accum_val_slice_ptr = &accum_val_flat(i, 0);
+            SliceT accum_val_slice(accum_val_slice_ptr, slice_shape);
+
+            T* accum_slice_ptr = &(it->second.first->flat_outer_dims<T>())(0, 0);
+            SliceT accum_slice(accum_slice_ptr, slice_shape);
+            accum_val_slice.device(ctx->template eigen_device<Device>()) = accum_slice;
+        }
+    }
+
+    std::vector<int>* count_element_ = new std::vector<int>();    
+    count_element_->reserve(nnz);
+
+    {
+        std::map<int64, int>::iterator it;
+        for (it = (*count_element_map_).begin(); it!=(*count_element_map_).end(); ++it) {
+            count_element_->push_back(it->second);
+        }
+    }
+
+    auto accum_flat = accum_val_tensor_->flat_outer_dims<T>();
     std::vector<T> count_typet;
     std::transform(count_element_->begin(), count_element_->end(),
                    std::back_inserter(count_typet),
                    TypeConverter<T, int>::ConvertUToT);
 
-    // Option 1: divide all by counter
-    /*
-    std::transform(
-        &accum_flat(0,0), &accum_flat(nnz,0), &accum_flat(0,0),
-        std::bind2nd(std::divides<T>(),
-                     TypeConverter<T, int>::ConvertUToT(this->counter_)));
-    */
-
-    // Option 2: average element-wise
-    Eigen::DSizes<Eigen::DenseIndex, 1> slice_shape(accum_flat.dimension(1));
-    for (int64 i = 0; i < nnz; i++) {
-      T* accum_slice_ptr = &accum_flat(i, 0);
-      SliceT accum_slice(accum_slice_ptr, slice_shape);
-      accum_slice.device(ctx->template eigen_device<Device>()) =
-          accum_slice / count_typet[i];
+    switch(average_option) {
+      case 1:
+        // Option 1: divide all by counter
+    
+        std::transform(
+          &accum_flat(0,0), &accum_flat(nnz,0), &accum_flat(0,0),
+          std::bind2nd(std::divides<T>(),
+                       TypeConverter<T, int>::ConvertUToT(this->counter_)));
+      break;
+      case 2:    
+        // Option 2: average element-wise
+        Eigen::DSizes<Eigen::DenseIndex, 1> slice_shape(accum_flat.dimension(1));
+        for (int64 i = 0; i < nnz; i++) {
+        T* accum_slice_ptr = &accum_flat(i, 0);
+        SliceT accum_slice(accum_slice_ptr, slice_shape);
+        accum_slice.device(ctx->template eigen_device<Device>()) =
+            accum_slice / count_typet[i];
+        }
+      break;
     }
+
+    //accum_val_tensor_ -> map
+    //below assignment might not be needed
+    accum_val_flat = accum_val_tensor_->flat_outer_dims<T>();
+    {
+        Eigen::DSizes<Eigen::DenseIndex, 1> slice_shape(num_col);
+        std::map<int64, std::pair<Tensor*, PersistentTensor*>>::iterator it;
+        int64 i;
+        for (it = (*accum_idx_val_val_persistent_map_).begin(), i = 0; it!=(*accum_idx_val_val_persistent_map_).end() ; ++it, ++i) {
+            T* accum_slice_ptr = &(it->second.first->flat_outer_dims<T>())(0, 0);
+            SliceT accum_slice(accum_slice_ptr, slice_shape);
+            T* accum_val_slice_ptr = &accum_val_flat(i, 0);
+            SliceT accum_val_slice(accum_val_slice_ptr, slice_shape);
+
+            accum_slice.device(ctx->template eigen_device<Device>()) = accum_val_slice;
+        }
+    }
+
+    if (count_element_ != nullptr) delete count_element_;
+    LOG(INFO) << "Divide";
   }
 
   bool SetOutput(OpKernelContext* ctx) override {
     bool is_successful = true;
+    LOG(INFO) << "SetOutput";
     if (is_successful) is_successful = ReturnIdxTensor(ctx);
+    LOG(INFO) << "SetOutput1";
     if (is_successful) is_successful = ReturnValTensor(ctx);
+    LOG(INFO) << "SetOutput2";
     if (is_successful) is_successful = ReturnShapeTensor(ctx);
+    LOG(INFO) << "SetOutput3";
     return is_successful;
   }
 
@@ -407,50 +464,78 @@ class SparseConditionalAccumulator
   }
 
  private:
-  inline int cmp(std::vector<int64>* a_idx, const Tensor* b_idx,
-                 const int64 a_row, const int64 b_row) {
-    const int64 a = a_idx->at(a_row);
-    const int64 b = b_idx->vec<int64>()(b_row);
-    if (a < b) {
-      return -1;
-    } else if (a > b) {
-      return 1;
-    }
-    return 0;
-  }
-
   inline bool ReturnIdxTensor(OpKernelContext* ctx) {
     Tensor* idx_tensor;
-    const int64 nnz = accum_idx_vec_->size();
+    const int64 nnz = accum_idx_val_val_persistent_map_->size();
     OP_REQUIRES_OK_BOOLEAN(ctx, ctx->allocate_output(0, {nnz}, &idx_tensor));
     // If allocate_output fails, OP_REQUIRES_OK_BOOLEAN will short-circuit
     // the remaining code and just return false
     auto idx_tensor_vec = idx_tensor->vec<int64>();
-    for (int i = 0; i < nnz; ++i) {
-      idx_tensor_vec(i) = accum_idx_vec_->at(i);
+    {
+        std::map<int64, std::pair<Tensor*, PersistentTensor*>>::iterator it;
+        int64 i;
+        for (it = (*accum_idx_val_val_persistent_map_).begin(), i = 0 ; it!=(*accum_idx_val_val_persistent_map_).end() ; ++it, ++i) {
+            idx_tensor_vec(i) = it->first;
+        }
     }
+
+    LOG(INFO) << "ReturnIdx - idx : " << idx_tensor->flat<int64>();
+
     return true;
   }
 
   inline bool ReturnValTensor(OpKernelContext* ctx) {
-    ctx->set_output(1, *accum_val_);
+    Tensor* accum_val_tensor = nullptr;
+    const int64 nnz = accum_idx_val_val_persistent_map_->size();
+    LOG(INFO) << "ReturnVal - nnz : " << nnz;
+    Tensor* accum_map_val_first_ = (*accum_idx_val_val_persistent_map_).begin()->second.first;
+    TensorShape accum_val_shape = accum_map_val_first_->shape();
+    accum_val_shape.set_dim(0, nnz);
+    OP_REQUIRES_OK_BOOLEAN(ctx, ctx->allocate_output(1, accum_val_shape, &accum_val_tensor));
+    auto accum_val_flat = accum_val_tensor->flat_outer_dims<T>();
+    const int64 num_col = (accum_map_val_first_->flat_outer_dims<T>()).dimension(1);
+
+    LOG(INFO) << "ReturnVal - num_col : " << num_col;
+
+    Eigen::DSizes<Eigen::DenseIndex, 1> slice_shape(num_col);
+    {
+        std::map<int64, std::pair<Tensor*, PersistentTensor*>>::iterator it;
+        int64 i;
+        for (it = (*accum_idx_val_val_persistent_map_).begin(), i = 0; it!=(*accum_idx_val_val_persistent_map_).end(); ++it, ++i) {
+            T* accum_val_slice_ptr = &accum_val_flat(i, 0);
+            SliceT accum_val_slice(accum_val_slice_ptr, slice_shape);
+
+            T* accum_slice_ptr = &(it->second.first->flat_outer_dims<T>())(0, 0);
+            SliceT accum_slice(accum_slice_ptr, slice_shape);
+            accum_val_slice = accum_slice;
+        }
+    }
+
+    LOG(INFO) << "ReturnVal - val : " << accum_val_tensor->flat_outer_dims<T>();
+
     return true;
   }
 
   inline bool ReturnShapeTensor(OpKernelContext* ctx) {
-    int64 accum_val_dims = accum_val_->dims();
+    Tensor* accum_map_val_first_ = (*accum_idx_val_val_persistent_map_).begin()->second.first;
+    int64 accum_val_map_dims = accum_map_val_first_->dims();
     Tensor* shape_tensor;
     OP_REQUIRES_OK_BOOLEAN(
-        ctx, ctx->allocate_output(2, {accum_val_dims}, &shape_tensor));
+        ctx, ctx->allocate_output(2, {accum_val_map_dims}, &shape_tensor));
     // If allocate_output fails, OP_REQUIRES_OK_BOOLEAN will short-circuit
     // the remaining code and just return false
+
+    LOG(INFO) << "ReturnShape";
 
     // First dim of shape is defined by shape_, others by accum_val_->shape
     shape_tensor->flat<int64>()(0) =
         (shape_.dims() > 0) ? shape_.dim_size(0) : -1;
-    for (int64 i = 1; i < accum_val_dims; i++) {
-      shape_tensor->flat<int64>()(i) = accum_val_->dim_size(i);
+    for (int64 i = 1; i < accum_val_map_dims; i++) {
+      shape_tensor->flat<int64>()(i) = accum_map_val_first_->dim_size(i);
     }
+
+    LOG(INFO) << "ReturnShape - shape : " << shape_tensor->flat<int64>();
+
     return true;
   }
 
